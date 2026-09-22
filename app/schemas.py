@@ -260,6 +260,38 @@ class ThreadResponse(BaseModel):
     order: list[int]  # 拓扑/稳定排序后的归档 id 序列（父在子前）
 
 
+# ---------------------------------------------------------------------------
+# 投递状态报告（GET /messages/{id}/delivery-report，RFC 3464 DSN）
+# ---------------------------------------------------------------------------
+
+
+class DeliveryRecipient(BaseModel):
+    """一个逐收件人块的标准化字段。"""
+
+    final_recipient_type: str  # 小写地址类型，如 "rfc822"
+    final_recipient_address: str  # 去首尾空白后的地址（保留原始大小写）
+    action: str  # failed | delayed | delivered | relayed | expanded（小写）
+    status: str  # RFC 3463 三段数字增强状态码
+    diagnostic_code: Optional[str] = None
+    remote_mta: Optional[str] = None
+    last_attempt_date: Optional[str] = None
+
+
+class DeliveryReport(BaseModel):
+    """一个 multipart/report; report-type=delivery-status 作用域的解析结果。"""
+
+    scope_node_path: str  # multipart/report 容器（作用域）节点路径
+    report_node_path: str  # 直接 message/delivery-status 子件节点路径
+    envelope_id: Optional[str] = None  # 每邮件块 Original-Envelope-Id
+    recipients: list[DeliveryRecipient]
+
+
+class DeliveryReportListResponse(BaseModel):
+    id: int
+    fingerprint: str
+    reports: list[DeliveryReport]
+
+
 class ErrorBody(BaseModel):
     code: str
     message: str

@@ -29,13 +29,14 @@ app/
   related.py     cid: 内嵌资源引用审计（RFC 2392，multipart/related 作用域）
   displaybody.py 展示正文选择（alternative/related/mixed 递归规则，纯只读）
   security.py    附件安全策略评估（双扩展/控制字符/禁止类型/嵌套/阈值，纯只读）
+  delivery.py    投递状态报告解析（RFC 3464 DSN / RFC 6522 multipart/report，纯只读）
   threading.py   会话关联构建（Message-ID/References 回复图、断链、拓扑排序，纯只读）
   database.py    SQLite 建表、事务化写入、消息/节点/附件查询
   errors.py      定位到节点的解析错误
   schemas.py     响应模型
-tests/           228 个 pytest 用例（指纹稳定性、损坏输入、附件库、
-                 cid 引用审计、展示正文选择、安全策略评估、会话关联、
-                 HTTP 端到端）
+tests/           265 个 pytest 用例（指纹稳定性、损坏输入、附件库、
+                 cid 引用审计、展示正文选择、安全策略评估、DSN 投递状态、
+                 会话关联、HTTP 端到端）
 Dockerfile
 docker-compose.yml
 requirements.txt
@@ -106,6 +107,7 @@ curl -X POST http://localhost:8000/messages \
 | GET | `/messages/{id}/related-resources` | 审计 HTML 对 `cid:` 内嵌资源的引用（见下） |
 | GET | `/messages/{id}/display-body?prefer=html\|plain` | 选择客户端应展示的正文（见下） |
 | GET | `/messages/{id}/security-report` | 只读附件安全策略评估（见下，阈值可查询参数覆盖） |
+| GET | `/messages/{id}/delivery-report` | 解析 RFC 3464 投递状态报告（DSN，见下） |
 | GET | `/messages/{id}/thread` | 会话关联查询：回复图、断链与拓扑排序（见下） |
 | GET | `/attachments` | 附件库列表（分页 + `sha256`/`filename`/`media_type` 过滤） |
 | GET | `/attachments/{sha256}/content` | 下载附件原始解码字节（支持单段 `bytes` Range） |
@@ -389,6 +391,99 @@ curl 'http://localhost:8000/messages/1/security-report?max_decoded_bytes=1048576
 无风险邮件返回 `"allow": true` 与空 `violations`。邮件不存在返回
 **404**；阈值参数非法（负数、非整数）返回 **422**。
 
+## 投递状态报告（DSN）
+
+```bash
+curl http://localhost:8000/messages/1/delivery-report
+```
+
+在**已归档 MIME 树**上只读解析投递状态通知（Delivery Status
+Notification，RFC 3464 / RFC 6522）。该接口是**纯只读查询**：只读取
+归档时保存的节点行与附件库中的状态部分解码字节，不改写任何记录，对
+历史归档数据同样有效。
+
+**作用域识别**：遍历整棵 MIME 树（含 `message/rfc822` /
+`message/global` 封装报文内部），找出所有
+`Content-Type: multipart/report; report-type="delivery-status"`
+容器作为报告作用域（`report-type` 大小写不敏感）；其他
+`report-type`（如 `disposition-notification` 的 MDN）或缺该参数的
+`multipart/report` 一律忽略。每个作用域必须有**恰好一个直接**
+`message/delivery-status` 子件——子件状态部分位于孙代、零个或多个
+均为结构错误。
+
+**正文解析**：`message/delivery-status` 正文按空行划分字段块——
+第 1 块为**每邮件块**（从中取 `Original-Envelope-Id` 作为
+`envelope_id`，无则为 `null`），其余每块为一个**逐收件人块**：
+
+- 换行兼容 **CRLF / LF / 裸 CR**；以空白开头的物理行按 RFC 5322
+  **折叠规则**并入上一逻辑行（连续空行与首尾空行容忍）；
+- 每个逐收件人块必须含三个必填字段，否则 **422**：
+  - `Final-Recipient`：形如 `addr-type; address`，地址类型规范化为
+    小写（如 `RFC822` → `rfc822`），地址去首尾空白后保留原始大小写；
+  - `Action`：`failed` / `delayed` / `delivered` / `relayed` /
+    `expanded` 之一（大小写不敏感，输出规范化为小写）；
+  - `Status`：RFC 3463 增强状态码，**三段数字**、每段 1..3 位
+    （如 `5.1.1`、`4.4.1`）；
+- 保留可选字段 `Diagnostic-Code`、`Remote-MTA`、
+  `Last-Attempt-Date` 的去折叠原始值（缺失为 `null`）；每块内字段
+  重复、字段行无冒号、块首出现折叠续行同样是 **422**。
+
+响应按 **MIME 文档序**给出作用域节点、报告节点、信封标识与标准化
+收件人字段：
+
+```json
+{
+  "id": 1,
+  "fingerprint": "78d5be53…d01b1",
+  "reports": [
+    {
+      "scope_node_path": "",
+      "report_node_path": "2",
+      "envelope_id": "envelope-12345",
+      "recipients": [
+        {
+          "final_recipient_type": "rfc822",
+          "final_recipient_address": "bob@example.com",
+          "action": "failed",
+          "status": "5.1.1",
+          "diagnostic_code": "smtp; 550 5.1.1 No such user",
+          "remote_mta": "dns; mx.example.com",
+          "last_attempt_date": "Mon, 22 Sep 2026 11:00:00 +0000"
+        },
+        {
+          "final_recipient_type": "rfc822",
+          "final_recipient_address": "Carol@Example.COM",
+          "action": "delayed",
+          "status": "4.4.1",
+          "diagnostic_code": "smtp; 421 try later",
+          "remote_mta": null,
+          "last_attempt_date": null
+        }
+      ]
+    }
+  ]
+}
+```
+
+异常情况：
+
+- 邮件不存在：**404**；邮件中没有任何 DSN 作用域（普通邮件、MDN
+  等）：`200` 且 `"reports": []`；
+- 结构 / 必填字段非法：**422**，错误体带 `node_path`——作用域级
+  问题（多个/零个直接状态子件）定位到 `multipart/report` 节点，
+  正文级问题（字段块/字段损坏、必填字段缺失或值非法）定位到
+  `message/delivery-status` 节点；多个作用域时按文档序报告第一个
+  出错的作用域：
+
+| 错误码 `code` | 触发条件 |
+| ---- | ---- |
+| `MULTIPLE_DELIVERY_STATUS` | 同一作用域的直接子件中出现多个 `message/delivery-status`（`detail.candidates` 给出全部子件路径） |
+| `DELIVERY_STATUS_NOT_FOUND` | DSN 作用域没有直接 `message/delivery-status` 子件 |
+| `DELIVERY_STATUS_UNREADABLE` | 状态部分解码字节缺失或无法按声明字符集解码（如归档于附件库升级之前） |
+| `INVALID_DELIVERY_STATUS` | 正文为空、缺少逐收件人块、字段行无冒号、块内字段重复、块首折叠续行 |
+| `MISSING_DELIVERY_FIELD` | 逐收件人块缺少非空 `Final-Recipient` / `Action` / `Status`（`detail.field`） |
+| `INVALID_DELIVERY_FIELD` | `Final-Recipient` 不是 `type; address`、`Action` 枚举非法或 `Status` 非三段数字（`detail.field` / `detail.value`） |
+
 ## 会话关联查询
 
 ```bash
@@ -558,6 +653,7 @@ curl -H 'Range: bytes=-50'   http://localhost:8000/attachments/c1e372ae…/conte
 | `UNDECODABLE_CONTENT` | base64 / quoted-printable / 字符集解码失败，或 7bit 含非 ASCII 字节 |
 | `UNDECODABLE_HEADER` | RFC 2047 编码字（B/Q）本身损坏 |
 | `AMBIGUOUS_RELATED_START` / `RELATED_START_NOT_FOUND` | `display-body` 查询时 multipart/related 的 `start` 重复命中或未命中（查询期错误，不改写记录） |
+| `MULTIPLE_DELIVERY_STATUS` / `DELIVERY_STATUS_NOT_FOUND` / `DELIVERY_STATUS_UNREADABLE` / `INVALID_DELIVERY_STATUS` / `MISSING_DELIVERY_FIELD` / `INVALID_DELIVERY_FIELD` | `delivery-report` 查询时 DSN 作用域结构或 `message/delivery-status` 字段非法（查询期错误，不改写记录） |
 
 ## 指纹规范化规则
 

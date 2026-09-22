@@ -15,6 +15,7 @@ from typing import Literal, Optional
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 
 from . import database
+from .delivery import extract_delivery_reports
 from .displaybody import select_display_body
 from .errors import MIMEParseError
 from .mimeparser import fingerprint, parse_message, raw_sha256
@@ -24,6 +25,9 @@ from .schemas import (
     AttachmentListResponse,
     AttachmentOccurrence,
     AttachmentSummary,
+    DeliveryRecipient,
+    DeliveryReport,
+    DeliveryReportListResponse,
     DisplayBodyResponse,
     DisplayBodyStep,
     MessageCreated,
@@ -93,8 +97,12 @@ app = FastAPI(
         "In-Reply-To / References 构建确定性回复图：缺失父件与循环"
         "引用保留为可定位断链，同一会话按引用关系拓扑排序，无法关联"
         "时按规范化主题与时间稳定分组。"
+        "/messages/{id}/delivery-report 在已保存 MIME 树上只读识别"
+        "multipart/report; report-type=delivery-status 作用域并按 "
+        "RFC 3464 解析其直接 message/delivery-status 子件（兼容"
+        "CRLF/LF 与折叠行，逐收件人校验 Final-Recipient/Action/Status）。"
     ),
-    version="1.5.0",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -522,6 +530,78 @@ def get_security_report(
                 detail=v.detail,
             )
             for v in report.violations
+        ],
+    )
+
+
+# ---------------------------------------------------------------------------
+# 投递状态报告（DSN）
+# ---------------------------------------------------------------------------
+
+
+@app.get(
+    "/messages/{message_id}/delivery-report",
+    response_model=DeliveryReportListResponse,
+)
+def get_delivery_report(
+    message_id: int,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> DeliveryReportListResponse:
+    """从已归档 MIME 树提取 RFC 3464 投递状态报告（纯只读，不改写记录）。
+
+    遍历整棵已保存 MIME 树（含 ``message/rfc822`` 封装报文内部），
+    识别每个 ``multipart/report; report-type="delivery-status"``
+    （RFC 6522）作用域，解析其**直接** ``message/delivery-status``
+    子件（RFC 3464）：
+
+    * 按空行区分**每邮件块**（取 ``Original-Envelope-Id`` 作为信封
+      标识）与**逐收件人块**，兼容 CRLF / LF / 裸 CR 与折叠行；
+    * 逐收件人块必须含 ``Final-Recipient``（``addr-type; address``）、
+      ``Action``（failed/delayed/delivered/relayed/expanded）与
+      ``Status``（RFC 3463 三段数字增强状态码），并保留
+      ``Diagnostic-Code``、``Remote-MTA``、``Last-Attempt-Date``；
+    * 结果按 MIME 文档序给出作用域节点、报告节点、信封标识与标准化
+      收件人字段。
+
+    同一作用域出现多个/零个状态子件、字段块结构损坏或必填字段缺失/
+    非法时返回带 ``node_path`` 的 **422**（作用域问题定位到
+    multipart/report 节点，正文问题定位到 message/delivery-status
+    节点）。邮件不存在返回 **404**；邮件中没有任何投递状态报告作用
+    域时 ``reports`` 为空列表。
+    """
+
+    msg = database.get_message(conn, message_id)
+    if msg is None:
+        raise _message_404(message_id)
+    rows = database.list_nodes(conn, message_id)
+
+    def load_blob(sha256: str) -> Optional[bytes]:
+        row = database.get_attachment(conn, sha256)
+        return None if row is None else row["content"]
+
+    reports = extract_delivery_reports(rows, load_blob=load_blob)
+    return DeliveryReportListResponse(
+        id=message_id,
+        fingerprint=msg["fingerprint"],
+        reports=[
+            DeliveryReport(
+                scope_node_path=r.scope_node_path,
+                report_node_path=r.report_node_path,
+                envelope_id=r.envelope_id,
+                recipients=[
+                    DeliveryRecipient(
+                        final_recipient_type=rcp.final_recipient_type,
+                        final_recipient_address=rcp.final_recipient_address,
+                        action=rcp.action,
+                        status=rcp.status,
+                        diagnostic_code=rcp.diagnostic_code,
+                        remote_mta=rcp.remote_mta,
+                        last_attempt_date=rcp.last_attempt_date,
+                    )
+                    for rcp in r.recipients
+                ],
+            )
+            for r in reports
         ],
     )
 
