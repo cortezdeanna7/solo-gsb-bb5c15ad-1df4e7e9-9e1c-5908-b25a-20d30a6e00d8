@@ -260,6 +260,48 @@ class ThreadResponse(BaseModel):
     order: list[int]  # 拓扑/稳定排序后的归档 id 序列（父在子前）
 
 
+# ---------------------------------------------------------------------------
+# 投递状态通知（GET /messages/{id}/delivery-report，RFC 3464 DSN）
+# ---------------------------------------------------------------------------
+
+
+class DeliveryEnvelope(BaseModel):
+    """每邮件块（信封标识），缺失字段为 null。"""
+
+    original_envelope_id: Optional[str] = None
+    reporting_mta: Optional[str] = None
+    received_from_mta: Optional[str] = None
+    arrival_date: Optional[str] = None
+
+
+class DeliveryRecipient(BaseModel):
+    """一个逐收件人块的标准化字段（按 MIME 文档序）。"""
+
+    final_recipient: str  # "type; value" 中的地址值
+    final_recipient_type: str  # 地址类型（小写），如 rfc822
+    action: str  # failed | delayed | delivered | relayed | expanded
+    status: str  # 三段数字增强状态码（class.subject.detail）
+    diagnostic_code: Optional[str] = None
+    remote_mta: Optional[str] = None
+    last_attempt_date: Optional[str] = None
+
+
+class DeliveryReport(BaseModel):
+    """一个 multipart/report 投递状态作用域的解析结果。"""
+
+    scope_node_path: str  # multipart/report; report-type=delivery-status 节点
+    report_node_path: str  # 其直接 message/delivery-status 子件
+    envelope: DeliveryEnvelope
+    recipients: list[DeliveryRecipient]
+
+
+class DeliveryReportResponse(BaseModel):
+    id: int
+    fingerprint: str
+    # 邮件没有任何投递状态作用域时为空列表
+    reports: list[DeliveryReport]
+
+
 class ErrorBody(BaseModel):
     code: str
     message: str

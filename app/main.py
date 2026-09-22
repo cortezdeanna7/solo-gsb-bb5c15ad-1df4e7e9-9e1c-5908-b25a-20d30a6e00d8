@@ -15,6 +15,7 @@ from typing import Literal, Optional
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 
 from . import database
+from .deliveryreport import extract_delivery_reports
 from .displaybody import select_display_body
 from .errors import MIMEParseError
 from .mimeparser import fingerprint, parse_message, raw_sha256
@@ -24,6 +25,10 @@ from .schemas import (
     AttachmentListResponse,
     AttachmentOccurrence,
     AttachmentSummary,
+    DeliveryEnvelope,
+    DeliveryRecipient,
+    DeliveryReport as DeliveryReportModel,
+    DeliveryReportResponse,
     DisplayBodyResponse,
     DisplayBodyStep,
     MessageCreated,
@@ -93,8 +98,14 @@ app = FastAPI(
         "In-Reply-To / References 构建确定性回复图：缺失父件与循环"
         "引用保留为可定位断链，同一会话按引用关系拓扑排序，无法关联"
         "时按规范化主题与时间稳定分组。"
+        "/messages/{id}/delivery-report 在已归档 MIME 树中识别"
+        "multipart/report; report-type=delivery-status 作用域，"
+        "解析其直接 message/delivery-status 子件（RFC 3464）："
+        "每邮件块与逐收件人块按空行区分，兼容 CRLF/LF 与折叠行，"
+        "逐收件人校验 Final-Recipient / Action / Status，并保留"
+        "Diagnostic-Code / Remote-MTA / Last-Attempt-Date。"
     ),
-    version="1.5.0",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -603,6 +614,82 @@ def get_thread(
             for b in result.broken_links
         ],
         order=result.order,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 投递状态通知（RFC 3464 DSN）
+# ---------------------------------------------------------------------------
+
+
+@app.get(
+    "/messages/{message_id}/delivery-report",
+    response_model=DeliveryReportResponse,
+)
+def get_delivery_report(
+    message_id: int,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> DeliveryReportResponse:
+    """在已归档 MIME 树上解析投递状态通知（纯只读，不改写记录）。
+
+    按 MIME 文档序识别全部
+    ``multipart/report; report-type=delivery-status`` 作用域
+    （RFC 6522），解析每个作用域的**直接**
+    ``message/delivery-status`` 子件（RFC 3464）：
+
+    * 状态体按空行区分**每邮件块**（信封标识）与**逐收件人块**，
+      兼容 CRLF / LF / 裸 CR 与 RFC 5322 折叠行；
+    * 逐收件人块必须含 ``Final-Recipient``、``Action``、``Status``；
+      ``Action`` 取 RFC 3464 五个合法值，``Status`` 校验为三段数字；
+      ``Diagnostic-Code`` / ``Remote-MTA`` / ``Last-Attempt-Date``
+      原样保留（缺失为 null）；
+    * 同一作用域出现多个直接状态子件、状态体结构或必填字段非法时
+      返回带 ``node_path`` 的 **422**。
+
+    邮件不存在返回 **404**；邮件存在但没有投递状态作用域时
+    ``reports`` 为空列表。
+    """
+
+    msg = database.get_message(conn, message_id)
+    if msg is None:
+        raise _message_404(message_id)
+    rows = database.list_nodes(conn, message_id)
+
+    def blob_loader(sha256: str) -> Optional[bytes]:
+        row = database.get_attachment(conn, sha256)
+        return None if row is None else row["content"]
+
+    # 结构/字段非法抛 MIMEParseError，由全局异常处理器转成带
+    # node_path 的 422；本接口只读取节点行与附件库，不回写任何记录。
+    reports = extract_delivery_reports(rows, blob_loader)
+    return DeliveryReportResponse(
+        id=message_id,
+        fingerprint=msg["fingerprint"],
+        reports=[
+            DeliveryReportModel(
+                scope_node_path=r.scope_node_path,
+                report_node_path=r.report_node_path,
+                envelope=DeliveryEnvelope(
+                    original_envelope_id=r.envelope.original_envelope_id,
+                    reporting_mta=r.envelope.reporting_mta,
+                    received_from_mta=r.envelope.received_from_mta,
+                    arrival_date=r.envelope.arrival_date,
+                ),
+                recipients=[
+                    DeliveryRecipient(
+                        final_recipient=rcp.final_recipient,
+                        final_recipient_type=rcp.final_recipient_type,
+                        action=rcp.action,
+                        status=rcp.status,
+                        diagnostic_code=rcp.diagnostic_code,
+                        remote_mta=rcp.remote_mta,
+                        last_attempt_date=rcp.last_attempt_date,
+                    )
+                    for rcp in r.recipients
+                ],
+            )
+            for r in reports
+        ],
     )
 
 
